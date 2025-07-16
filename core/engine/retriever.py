@@ -21,3 +21,12 @@ from ...setting import RAGSettings
 
 load_dotenv()
 
+class TwoStageRetriever(QueryFusionRetriever):
+    def __init__(
+        self,
+        retrievers: List[BaseRetriever],
+        setting: RAGSettings | None = None,
+        llm: str | None=None,
+        query_gen_prompt: str | None = None,
+        mode : FUSION_MODES = FUSION_MODES.SIMPLE,
+    )
