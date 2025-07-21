@@ -29,4 +29,150 @@ class TwoStageRetriever(QueryFusionRetriever):
         llm: str | None=None,
         query_gen_prompt: str | None = None,
         mode : FUSION_MODES = FUSION_MODES.SIMPLE,
-    )
+        similarity_top_k: int = ...,
+        num_queries : int = 4,
+        use_async : bool = True,
+        verbose: bool = False,
+        callback_manager: CallbackManager | None=None,
+        objects : List[IndexNode] | None=None,
+        object_map : dict | None = None,
+        retriever_weights : List[float] | None = None
+    ) -> None:
+        super().__init__(
+            retrievers,setting,llm, query_gen_prompt, mode,similarity_top_k, num_queries,
+            use_async,verbose, callback_manager, objects, object_map, retriever_weights
+        )
+        
+        self._setting = setting or RAGSettings()
+        self._rerank_model= SentenceTransformerRerank(
+            top_n=self._setting.retriever.top_k_rerank,
+            model = self._setting.retriever.rerank_llm,
+        )
+        
+    def _retrieve(self, query_bundle = QueryBundle) -> List[NodeWithScore]:
+        queries : List[QueryBundle] = [query_bundle]
+        if self.num_queries > 1 :
+            queries.extend(self._get_queries(query_bundle.query_str))
+            
+            
+        if self.use_async:
+            results = self._run_nested_async_queries(queries)
+        else:
+            results = self._run_async_queries(queries)
+        results = self._simple_fusion(queries)
+        return self._rerank_model.postprocess_nodes(results, query_bundle)
+    
+    async def _aretrieve(self, query_bundle : QueryBundle) -> List[NodeWithScore]:
+        queries : List[QueryBundle] = [query_bundle]
+        if self.num_queries> 1:
+            queries.extend(self._get_queries(query_bundle.query_str))
+            
+        results = await self._run_async_queries(queries)
+        results = self._simple_fusion(results)
+        return self._rerank_model.postprocess_nodes(results, query_bundle)
+    
+    
+class LocalRetriever:
+    def __init__(
+        self,
+        setting: RAGSettings | None = None,
+        host : str = "host.docker.internal"
+        ):
+            super().__init__()
+            self._setting = setting or RAGSettings()
+            self._host = host
+            
+            
+    def _get_normal_retriever(
+        self,
+        vector_index : VectorStoreIndex,
+        llm: LLM | None= None,
+        language : str = "eng"
+    ):
+        llm = llm or Settings.llm
+        return VectorIndexRetriever(
+            index = vector_index,
+            similarity_top_k=self._setting.retriever.similarity_top_k,
+            embed_model=Settings.embed_model,
+            verbose=True
+        )
+        
+    def _get_hybrid_retriever(
+        self,
+        vector_index : VectorStoreIndex,
+        llm : LLM | None = None,
+        language: str = "eng",
+        gen_query: bool = True
+    ):
+        #VECTOR INDEX RETRIEVER
+        vector_retriever = VectorIndexRetriever(
+            index = vector_index,
+            similarity_top_k=self._setting.retriever.similarity_top_k,
+            embed_model=Settings.embed_model,
+            verbose=True,
+        )
+        
+        bm25_retriever = BM25Retriever.from_defaults(
+            index=vector_index,
+            similarity_top_k=self._setting.retriever.similarity_top_k,
+            verbose=True
+        )
+        
+        ## FUSION RETRIEVER
+        if gen_query:
+            hybrid_retriever = QueryFusionRetriever(
+                retrievers=[bm25_retriever, vector_retriever],
+                retriever_weights=self._setting.retriever.retriever_weights,
+                llm=llm,
+                query_gen_prompt= get_query_gen_prompt(language),
+                similarity_top_k=self._setting.retriever.top_k_rerank,
+                num_queries= self._setting.retriever.num_queries,
+                mode = self._setting.retriever.fusion_mode,
+                verbose=True
+            )
+        else:
+            hybrid_retriever = TwoStageRetriever(
+                retrievers=[bm25_retriever,vector_retriever],
+                retriever_weights= self._setting.retriever.retriever_weights,
+                llm=llm,
+                query_gen_prompt=None,
+                similarity_top_k= self._setting.retriever.similarity_top_k,
+                num_queries=1,
+                mode = self._setting.retriever.fusion_mode,
+                verbose=True
+            )
+            
+        return hybrid_retriever
+    
+    
+    def _get_router_retriever(
+        self,
+        vector_index : VectorStoreIndex,
+        llm : LLM | None = None,
+        language: str = "eng"
+    ):
+        
+        fusion_tool = RetrieverTool.from_defaults(
+            retriever= self._get_hybrid_retriever(
+                vector_index, llm, language, gen_query=True
+            ),
+            description= "Use this tool when the user's query is clear and unambiguous.",
+            name = "Two Stage Retriever with BM25 and Vector Retriever and LLM Rerank"
+        )
+        
+    def get_retriever(
+        self,
+        nodes: List[BaseNode],
+        llm: LLM | None = None,
+        language: str = 'eng',
+        
+    ):
+        vector_index = VectorStoreIndex(nodes= nodes)
+        if len(nodes) > self._setting.retriever.top_k_rerank:
+            retriever = self._get_router_retriever(vector_index, llm, language)
+        else:
+            retriever = self._get_normal_retriever(vector_index, llm, language)
+            
+        return retriever
+            
+            
