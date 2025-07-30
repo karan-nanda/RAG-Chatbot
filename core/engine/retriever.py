@@ -160,7 +160,7 @@ class LocalRetriever:
             name = "Two Stage Retriever with BM25 and Vector Retriever and LLM Rerank"
         )
         
-    def get_retriever(
+    def get_retrievers(
         self,
         nodes: List[BaseNode],
         llm: LLM | None = None,
